@@ -1,4 +1,4 @@
-/*
+ /*
   TX_Wave - ESP32 TX (transmitter) unit
   Mục đích: gửi lệnh điều khiển (bật/tắt LED) qua ESP-NOW tới máy nhận (RX)
   - Nút 1 (BTN1): chế độ chống trộm (gửi id=1)

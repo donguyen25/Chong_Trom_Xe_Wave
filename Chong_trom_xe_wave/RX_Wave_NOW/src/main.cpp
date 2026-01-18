@@ -14,17 +14,16 @@
   Vui lòng kiểm tra kỹ trước khi sử dụng trong thực tế!
 */
 
-/*============================ Các thư viện cần thiết ============================*/
 #include <WiFi.h>
 #include <esp_now.h>
 #include <EEPROM.h>
 
 /* ================================= PIN MAP ================================== */
-#define RELAY1_PIN 9    // Đề xe
-#define RELAY2_PIN 10   // Xi Nhan
-#define BUZZER_PIN 2    // Còi Báo Động
-#define LED_IND    3    // LED Chỉ Thị Kết Nối
-#define SW420_PIN  4    // Cảm Biến Rung 
+#define RELAY1_PIN 6
+#define RELAY2_PIN 7
+#define BUZZER_PIN 5
+#define LED_IND    8
+#define SW420_PIN  4
 
 /* ==================================== FSM ===================================== */
 enum SystemState {
@@ -38,29 +37,32 @@ SystemState systemState = DISARMED;
 /* =================================== ESP-NOW MSG ============================== */
 typedef struct {
   uint8_t cmd;   // 1 = ARM/DISARM, 2 = FIND
-  uint8_t state; // optional
+  uint8_t state;
 } esp_msg_t;
 
 esp_msg_t rxMsg;
 
 /* ===================================== TIME CONFIG ================================ */
-const unsigned long CONNECT_TIMEOUT_MS = 3000;  //Phát hiện mất kết nối TX
-const unsigned long LED_BLINK_MS       = 500;   //  Chu kỳ LED nhấp nháy
-const unsigned long CONNECT_BEEP_MS    = 2000;  //  Thời gian Bíp khi kết nối lại
+const unsigned long CONNECT_TIMEOUT_MS = 3000;
+const unsigned long LED_BLINK_MS       = 500;
+const unsigned long CONNECT_BEEP_MS    = 2000;
 
-const unsigned long ARM_BLINK_MS       = 150; // Thời gian nhấp nháy khi ARM/DISARM
-const int ARM_BLINK_TIMES              = 3;   // Số lần nhấp nháy khi ARM/DISARM
-const int FIND_BLINK_TIMES             = 5;   // Số lần nhấp nháy khi FIND
-const int VIB_BLINK_TIMES              = 10;  // Số lần nhấp nháy khi Rung Phát Hiện
+const unsigned long ARM_BLINK_MS       = 150;
+const int ARM_BLINK_TIMES              = 1;
+const int DISARM_BLINK_TIMES           = 2;
+const int FIND_BLINK_TIMES             = 5;
+const int VIB_BLINK_TIMES              = 10;
 
-const unsigned long ALARM_DURATION_MS  = 3000; // Thời gian báo động
-const unsigned long VIB_DEBOUNCE_MS    = 800;  // Thời gian chống chớp khi cảm biến rung kích hoạt
+const unsigned long ALARM_DURATION_MS  = 3000;
+const unsigned long VIB_DEBOUNCE_MS    = 800;
+const unsigned long ARM_STABILIZE_MS   = 1500;  // Thời gian ổn định sau khi bật chống trộm
 
 /* =================================== TIME VAR ================================== */
 unsigned long lastRecvTime = 0;
 unsigned long lastLedMillis = 0;
 unsigned long alarmStartMillis = 0;
 unsigned long lastVibMillis = 0;
+unsigned long armStartMillis = 0;  // Lưu thời gian bắt đầu bật chống trộm
 
 /* ================================== FLAGS ===================================== */
 bool ledState = false;
@@ -72,18 +74,40 @@ bool wasConnected = false;
 #define ADDR_MAGIC 0
 #define ADDR_STATE 1
 
-/* ===================== HELPER: Blink relay2 + buzzer ===================== */
-// Hàm này tạo các xung bật/tắt ngắn cho RELAY2 và còi.
-// Lưu ý: sử dụng `delay()` nên hoạt động mang tính blocking ngắn,
-// phù hợp cho các tín hiệu cảnh báo/hiển thị nhỏ.
-void blinkRelay2Buzzer(int times) {
-  for (int i = 0; i < times; i++) {
-    digitalWrite(RELAY2_PIN, HIGH);
-    digitalWrite(BUZZER_PIN, HIGH);
-    delay(ARM_BLINK_MS);
-    digitalWrite(RELAY2_PIN, LOW);
-    digitalWrite(BUZZER_PIN, LOW);
-    delay(ARM_BLINK_MS);
+/* ===================== NON-BLOCKING BLINK TASK ===================== */
+bool blinkActive = false;
+bool blinkState = false;
+int blinkCount = 0;
+int blinkTarget = 0;
+unsigned long lastBlinkMillis = 0;
+
+void startBlink(int times) {
+  blinkActive = true;
+  blinkTarget = times * 2;   // ON + OFF
+  blinkCount = 0;
+  blinkState = false;
+  lastBlinkMillis = millis();
+  digitalWrite(RELAY2_PIN, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+void handleBlink() {
+  if (!blinkActive) return;
+
+  unsigned long now = millis();
+  if (now - lastBlinkMillis >= ARM_BLINK_MS) {
+    lastBlinkMillis = now;
+    blinkState = !blinkState;
+
+    digitalWrite(RELAY2_PIN, blinkState);
+    digitalWrite(BUZZER_PIN, blinkState);
+
+    blinkCount++;
+    if (blinkCount >= blinkTarget) {
+      blinkActive = false;
+      digitalWrite(RELAY2_PIN, LOW);
+      digitalWrite(BUZZER_PIN, LOW);
+    }
   }
 }
 
@@ -101,9 +125,6 @@ void loadState() {
   }
 }
 
-// Lưu ý: `saveState()` và `loadState()` đảm bảo trạng thái ARM/DISARM
-// được duy trì qua khởi động lại bằng EEPROM.
-
 /* ===================================== ESP-NOW RX ============================= */
 void onReceive(const uint8_t *mac, const uint8_t *data, int len) {
   if (len != sizeof(rxMsg)) return;
@@ -111,27 +132,21 @@ void onReceive(const uint8_t *mac, const uint8_t *data, int len) {
   lastRecvTime = millis();
 
   if (rxMsg.cmd == 1) { // ARM / DISARM
-    // Khi nhận lệnh ARM/DISARM:
-    // - Nếu đang DISARMED -> chuyển sang ARMED và bật RELAY1 (nguồn đề)
-    // - Nếu đang ARMED/ALARM -> về DISARMED và tắt RELAY1
     if (systemState == DISARMED) {
       systemState = ARMED;
+      armStartMillis = millis();  // Ghi nhận thời gian bắt đầu
       digitalWrite(RELAY1_PIN, HIGH);
-      blinkRelay2Buzzer(ARM_BLINK_TIMES);
+      startBlink(ARM_BLINK_TIMES);
     } else {
       systemState = DISARMED;
       digitalWrite(RELAY1_PIN, LOW);
-      // khi tắt (DISARM) cũng nhấp nháy relay2 + còi 3 lần
-      blinkRelay2Buzzer(ARM_BLINK_TIMES);
-      digitalWrite(RELAY2_PIN, LOW);
-      digitalWrite(BUZZER_PIN, LOW);
+      startBlink(DISARM_BLINK_TIMES);
     }
     saveState();
   }
 
   if (rxMsg.cmd == 2) { // FIND
-    // Lệnh tìm xe: tạo vài lần nháy/tiếng để dễ xác định vị trí
-    blinkRelay2Buzzer(FIND_BLINK_TIMES);
+    startBlink(FIND_BLINK_TIMES);
   }
 }
 
@@ -151,37 +166,34 @@ void setup() {
   if (systemState == ARMED)
     digitalWrite(RELAY1_PIN, HIGH);
 
+  // Power-on beep
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(200);
+  digitalWrite(BUZZER_PIN, LOW);
+  delay(100);
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(200);
+  digitalWrite(BUZZER_PIN, LOW);
+
   WiFi.mode(WIFI_STA);
   esp_now_init();
   esp_now_register_recv_cb(onReceive);
 
-  Serial.println("RX FSM READY");
+  Serial.println("RX FSM READY (NON-BLOCKING)");
 }
-
-// Thiết lập phần cứng và ESP-NOW
-// - Khởi tạo các chân I/O, EEPROM và trạng thái ban đầu
-// - Đăng ký callback nhận dữ liệu `onReceive`
 
 /* =================================== LOOP ================================= */
 void loop() {
   unsigned long now = millis();
 
-  /* -------------- CONNECTION LED ---------- */
+  handleBlink();
+
+  /* -------- CONNECTION LED -------- */
   bool connected = (now - lastRecvTime < CONNECT_TIMEOUT_MS);
 
   if (connected) {
-    if (!wasConnected) {
-      wasConnected = true;
-      digitalWrite(BUZZER_PIN, HIGH);
-      delay(CONNECT_BEEP_MS);
-      digitalWrite(BUZZER_PIN, LOW);
-    }
     digitalWrite(LED_IND, HIGH);
   } else {
-    if (wasConnected) {
-      saveState();
-      wasConnected = false;
-    }
     if (now - lastLedMillis >= LED_BLINK_MS) {
       lastLedMillis = now;
       ledState = !ledState;
@@ -189,31 +201,25 @@ void loop() {
     }
   }
 
-  // Giải thích logic kết nối:
-  // - Nếu trong khoảng thời gian `CONNECT_TIMEOUT_MS` có gói nhận -> coi là connected
-  // - Khi mới kết nối lại sẽ tạo 1 bíp dài để báo
-  // - Khi mất kết nối, LED sẽ nhấp nháy để báo trạng thái mất TX
-
-  /* ---------------- VIBRATION CHECK ------------- */
+  /* -------- VIBRATION CHECK -------- */
   if (systemState == ARMED) {
-    if (digitalRead(SW420_PIN) == LOW) {
-      if (now - lastVibMillis > VIB_DEBOUNCE_MS) {
-        systemState = ALARM;
-        alarmStartMillis = now;
-        lastVibMillis = now;
-        // blink relay2 and buzzer VIB_BLINK_TIMES times
-        blinkRelay2Buzzer(VIB_BLINK_TIMES);
+    unsigned long timeArmed = now - armStartMillis;
+    // Chỉ kiểm tra vibration sau thời gian ổn định
+    if (timeArmed >= ARM_STABILIZE_MS) {
+      if (digitalRead(SW420_PIN) == LOW) {
+        if (now - lastVibMillis > VIB_DEBOUNCE_MS) {
+          systemState = ALARM;
+          alarmStartMillis = now;
+          lastVibMillis = now;
+          startBlink(VIB_BLINK_TIMES);
+        }
       }
     }
   }
 
-  // Kiểm tra rung (SW420): chỉ kích hoạt khi ARMED và có debounce
-
-  /* ------------------ ALARM STATE ----------------- */
+  /* -------- ALARM STATE -------- */
   if (systemState == ALARM) {
     if (now - alarmStartMillis >= ALARM_DURATION_MS) {
-      digitalWrite(RELAY2_PIN, LOW);
-      digitalWrite(BUZZER_PIN, LOW);
       systemState = ARMED;
     }
   }
